@@ -5,9 +5,11 @@ import firedrake
 import numpy as np
 import os
 import h5py
+import io
+import sqlite3
 
 
-__all__ = ["DumbCheckpoint", "HDF5File", "FILE_READ", "FILE_CREATE", "FILE_UPDATE"]
+__all__ = ["DumbCheckpoint", "HDF5File", "FILE_READ", "FILE_CREATE", "FILE_UPDATE", "SQLiteCheckpoint"]
 
 
 FILE_READ = PETSc.Viewer.Mode.READ
@@ -447,3 +449,79 @@ class HDF5File(object):
         if hasattr(self, "comm"):
             free_comm(self.comm)
             del self.comm
+
+
+# The following uses code from
+#     https://stackoverflow.com/questions/18621513/
+# to store numpy arrays in a SQLite database.
+def _adapt_array(array):
+    output = io.BytesIO()
+    np.save(output, array)
+    output.seek(0)
+    return sqlite3.Binary(output.read())
+
+
+def _convert_array(data):
+    output = io.BytesIO(data)
+    output.seek(0)
+    return np.load(output)
+
+
+sqlite3.register_adapter(np.ndarray, _adapt_array)
+sqlite3.register_converter("ARRAY", _convert_array)
+
+
+class SQLiteCheckpoint:
+    def __init__(self, filename, mode):
+        self._filename = filename
+        self._mode = mode
+        self._connection = sqlite3.connect(
+            self._filename, detect_types=sqlite3.PARSE_DECLTYPES
+        )
+
+        # Check whether there's a table named `functions` in the DB and create
+        # it if not
+        cursor = self._connection.cursor()
+        query = """
+            select name from sqlite_master
+            where type='table' and name='functions';
+        """
+        tables = cursor.execute(query).fetchall()
+        if not tables:
+            command = """
+                create table functions(
+                    name text,
+                    data array
+                );
+            """
+            cursor.execute(command)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        if "w" in self._mode:
+            self._connection.commit()
+        self._connection.close()
+
+    def store(self, function, name=None):
+        if self._mode == "r":
+            raise IOError("Cannot store to checkpoint opened in read-only mode!")
+        if not isinstance(function, firedrake.Function):
+            raise ValueError("Can only store functions!")
+
+        name = name or function.name()
+        array = function.dat.data_ro[:]
+
+        # Insert the current Function into the DB table `functions`
+        cursor = self._connection.cursor()
+        cursor.execute("insert into functions values (?, ?)", (name, array))
+
+    def load(self, function, name=None):
+        name = name or function.name()
+
+        # Load the entry with the name `name` from the DB table `functions`
+        # into the current Function
+        cursor = self._connection.cursor()
+        cursor.execute("select data from functions where name = ?", (name,))
+        function.dat.data[:] = cursor.fetchone()[0]
