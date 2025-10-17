@@ -1232,6 +1232,7 @@ def CircleManifoldMesh(
 @PETSc.Log.EventDecorator()
 def UnitDiskMesh(
     refinement_level=0,
+    variant="square",
     reorder=None,
     distribution_parameters=None,
     comm=COMM_WORLD,
@@ -1242,6 +1243,8 @@ def UnitDiskMesh(
     """Generate a mesh of the unit disk in 2D
 
     :kwarg refinement_level: optional number of refinements (0 is a diamond)
+    :kwarg variant: make disk mesh by warping a square ("square", the default)
+           or a hexagon ("hexagon")
     :kwarg reorder: (optional), should the mesh be reordered?
     :kwarg distribution_parameters: options controlling mesh
            distribution, see :func:`.Mesh` for details.
@@ -1254,24 +1257,53 @@ def UnitDiskMesh(
            when checkpointing; if `None`, the name is automatically
            generated.
     """
-    vertices = np.array(
-        [[0, 0], [1, 0], [1, 1], [0, 1], [-1, 1], [-1, 0], [-1, -1], [0, -1], [1, -1]],
-        dtype=np.double,
-    )
 
-    cells = np.array(
-        [
-            [0, 1, 2],
-            [0, 2, 3],
-            [0, 3, 4],
-            [0, 4, 5],
-            [0, 5, 6],
-            [0, 6, 7],
-            [0, 7, 8],
-            [0, 8, 1],
-        ],
-        np.int32,
-    )
+    if variant == "square":
+        vertices = np.array(
+            [
+                [0, 0],
+                [1, 0],
+                [1, 1],
+                [0, 1],
+                [-1, 1],
+                [-1, 0],
+                [-1, -1],
+                [0, -1],
+                [1, -1],
+            ],
+            dtype=np.double,
+        )
+
+        cells = np.array(
+            [
+                [0, 1, 2],
+                [0, 2, 3],
+                [0, 3, 4],
+                [0, 4, 5],
+                [0, 5, 6],
+                [0, 6, 7],
+                [0, 7, 8],
+                [0, 8, 1],
+            ],
+            np.int32,
+        )
+
+        warping_fn = lambda x: np.max(np.abs(x))
+
+    elif variant == "hexagon":
+        thetas = np.pi * np.array([0, 1/3, 2/3, 1, 4/3, 5/3])
+        xs = np.cos(thetas)
+        ys = np.sin(thetas)
+        vertices = np.vstack((np.array([[0, 0]]), np.column_stack((xs, ys))))
+        cells = np.array(
+            [[0, 1, 2], [0, 2, 3], [0, 3, 4], [0, 4, 5], [0, 5, 6], [0, 6, 1]], np.int32
+        )
+
+        phis = thetas + np.pi / 6
+        vs = np.column_stack((np.cos(phis), np.sin(phis)))
+        warping_fn = lambda x: (vs @ x).max()
+    else:
+        raise ValueError("'variant' must be either 'square' or 'hexagon'!")
 
     plex = mesh.plex_from_cell_list(
         2, cells, vertices, comm, mesh._generate_default_mesh_topology_name(name)
@@ -1293,62 +1325,7 @@ def UnitDiskMesh(
     for x in coords:
         norm = np.sqrt(np.dot(x, x))
         if norm > 1.0 / (1 << (refinement_level + 1)):
-            t = np.max(np.abs(x)) / norm
-            x[:] *= t
-
-    m = mesh.Mesh(
-        plex,
-        dim=2,
-        reorder=reorder,
-        distribution_parameters=distribution_parameters,
-        name=name,
-        distribution_name=distribution_name,
-        permutation_name=permutation_name,
-        comm=comm,
-    )
-    return m
-
-
-@PETSc.Log.EventDecorator()
-def UnitDiskHexagonMesh(
-    refinement_level=0,
-    reorder=None,
-    distribution_parameters=None,
-    comm=COMM_WORLD,
-    name=mesh.DEFAULT_MESH_NAME,
-    distribution_name=None,
-    permutation_name=None,
-):
-    thetas = np.pi * np.array([0, 1/3, 2/3, 1, 4/3, 5/3])
-    xs = np.cos(thetas)
-    ys = np.sin(thetas)
-    vertices = np.vstack((np.array([[0, 0]]), np.column_stack((xs, ys))))
-    cells = np.array(
-        [[0, 1, 2], [0, 2, 3], [0, 3, 4], [0, 4, 5], [0, 5, 6], [0, 6, 1]], np.int32
-    )
-
-    plex = mesh.plex_from_cell_list(
-        2, cells, vertices, comm, mesh._generate_default_mesh_topology_name(name)
-    )
-
-    plex.createLabel(dmcommon.FACE_SETS_LABEL)
-    plex.markBoundaryFaces("boundary_faces")
-    if plex.getStratumSize("boundary_faces", 1) > 0:
-        boundary_faces = plex.getStratumIS("boundary_faces", 1).getIndices()
-        for face in boundary_faces:
-            plex.setLabelValue(dmcommon.FACE_SETS_LABEL, face, 1)
-    plex.removeLabel("boundary_faces")
-    plex.setRefinementUniform(True)
-    for i in range(refinement_level):
-        plex = plex.refine()
-
-    phis = thetas + np.pi / 6
-    vs = np.column_stack((np.cos(phis), np.sin(phis)))
-    coords = plex.getCoordinatesLocal().array.reshape(-1, 2)
-    for x in coords:
-        norm = np.sqrt(np.dot(x, x))
-        if norm > 1.0 / (1 << (refinement_level + 1)):
-            t = (vs @ x).max() / norm
+            t = warping_fn(x) / norm
             x[:] *= t
 
     coords /= coords.max()
