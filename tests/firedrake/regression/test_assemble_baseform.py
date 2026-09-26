@@ -1,7 +1,8 @@
 import pytest
 import numpy as np
 from firedrake import *
-from firedrake.assemble import get_assembler
+from firedrake.assemble import BaseFormAssembler, get_assembler
+from firedrake.slate.slate import TensorBase, apply_slate_restructuring
 from firedrake.utils import ScalarType
 import ufl
 
@@ -382,3 +383,174 @@ def test_assemble_baseform_return_tensor_if_given():
 
     assert b0 is not b1
     assert b1 is tensor
+
+
+@pytest.fixture
+def slate_forms():
+    mesh = UnitSquareMesh(3, 3)
+    V = FunctionSpace(mesh, "CG", 1)
+    u = TrialFunction(V)
+    v = TestFunction(V)
+    mass = inner(u, v) * dx
+    stiffness = inner(grad(u), grad(v)) * dx
+    w = Function(V).interpolate(SpatialCoordinate(mesh)[0])
+    return V, mass, stiffness, w
+
+
+def assert_matrix_equal(result, terms):
+    # Compare an assembled matrix with a linear combination of assembled forms.
+    expected = None
+    for weight, form in terms:
+        mat = assemble(form).petscmat
+        if expected is None:
+            expected = mat.copy()
+            expected.scale(weight)
+        else:
+            expected.axpy(weight, mat)
+    diff = result.petscmat.copy()
+    diff.axpy(-1.0, expected)
+    assert diff.norm() < 1e-12 * expected.norm()
+
+
+@pytest.mark.parametrize("weight", [1, 2])
+def test_restructure_slate_formsum(slate_forms, weight):
+    V, mass, stiffness, w = slate_forms
+    expr = FormSum((Tensor(mass), weight), (stiffness, 1))
+
+    restructured = apply_slate_restructuring(expr)
+    assert isinstance(restructured, TensorBase)
+    assert_matrix_equal(assemble(expr), [(weight, mass), (1, stiffness)])
+
+
+def test_restructure_slate_maximal_subtree(slate_forms):
+    V, mass, stiffness, w = slate_forms
+    # A nested sum of several Slate and UFL components is one Slate subtree.
+    inner_sum = FormSum((Tensor(mass), 1), (stiffness, 3))
+    expr = FormSum((inner_sum, 2), (Tensor(stiffness), -1), (mass, 1))
+
+    restructured = apply_slate_restructuring(expr)
+    assert isinstance(restructured, TensorBase)
+    assert not any(isinstance(op, ufl.form.BaseForm) and not isinstance(op, TensorBase)
+                   for op in restructured.operands)
+    assert_matrix_equal(assemble(expr), [(3, mass), (5, stiffness)])
+
+
+def test_restructure_slate_action_adjoint(slate_forms):
+    V, mass, stiffness, w = slate_forms
+    u = TrialFunction(V)
+    v = TestFunction(V)
+    # A non-symmetric form distinguishes the adjoint from the form itself.
+    advection = inner(u.dx(0), v) * dx
+    A = Tensor(mass) + advection
+
+    Aw = ufl.Action(A, w)
+    assert isinstance(apply_slate_restructuring(Aw), TensorBase)
+    expected = assemble(action(mass + advection, w))
+    assert np.allclose(assemble(Aw).dat.data_ro, expected.dat.data_ro)
+
+    At = ufl.Adjoint(A)
+    assert isinstance(apply_slate_restructuring(At), TensorBase)
+    assert_matrix_equal(assemble(At), [(1, adjoint(mass)), (1, adjoint(advection))])
+
+    Atw = ufl.Action(At, w)
+    assert isinstance(apply_slate_restructuring(Atw), TensorBase)
+    expected = assemble(action(adjoint(mass + advection), w))
+    assert np.allclose(assemble(Atw).dat.data_ro, expected.dat.data_ro)
+
+
+def test_preprocess_slate_maximal_action(slate_forms):
+    V, mass, stiffness, w = slate_forms
+    # UFL distributes the action over the sum. The restructuring turns the action of the
+    # UFL component into a form, which then joins the Slate subtree.
+    expr = ufl.action(FormSum((Tensor(mass), 2), (stiffness, 1)), w)
+
+    assert isinstance(BaseFormAssembler.preprocess_base_form(expr), TensorBase)
+    expected = assemble(action(2 * mass + stiffness, w))
+    assert np.allclose(assemble(expr).dat.data_ro, expected.dat.data_ro)
+
+
+def test_preprocess_delays_tsfc_derivative():
+    mesh = UnitSquareMesh(1, 1)
+    V = FunctionSpace(mesh, "CG", 1)
+    u = Function(V)
+    v = TestFunction(V)
+    expr = derivative(u**2 * v * dx, u)
+
+    assert BaseFormAssembler.preprocess_base_form(expr) is expr
+
+
+def test_preprocess_delays_slate_derivative():
+    mesh = UnitSquareMesh(1, 1)
+    V = FunctionSpace(mesh, "CG", 1)
+    u = Function(V).interpolate(1 + SpatialCoordinate(mesh)[0])
+    v = TestFunction(V)
+    form = u**2 * v * dx
+
+    expr = derivative(Tensor(form), u)
+    assert isinstance(expr, ufl.classes.BaseFormDerivative)
+    assert isinstance(BaseFormAssembler.preprocess_base_form(expr), TensorBase)
+    assert_matrix_equal(assemble(expr), [(1, derivative(form, u))])
+
+
+def test_restructure_slate_pure_ufl_unchanged(slate_forms):
+    V, mass, stiffness, w = slate_forms
+    expr = ufl.Action(FormSum((mass, 1), (stiffness, 1)), w)
+    assert apply_slate_restructuring(expr) is expr
+
+
+def test_restructure_slate_partial_formsum(slate_forms):
+    V, mass, stiffness, w = slate_forms
+    # An assembled matrix has no Slate representation, so it stays in the FormSum,
+    # while the other components are collected into one Slate tensor.
+    matrix = assemble(stiffness)
+    expr = FormSum((Tensor(mass), 1), (matrix, 2), (stiffness, 3), (Tensor(stiffness), -1))
+
+    restructured = apply_slate_restructuring(expr)
+    assert isinstance(restructured, ufl.FormSum)
+    slate_parts = [c for c in restructured.components() if isinstance(c, TensorBase)]
+    assert len(slate_parts) == 1
+    assert len(restructured.components()) == 2
+    assert any(c is matrix for c in restructured.components())
+    assert_matrix_equal(assemble(expr), [(1, mass), (4, stiffness)])
+
+    # A nested mixed FormSum is flattened, so its Slate part joins the outer components.
+    nested = FormSum((FormSum((Tensor(mass), 1), (matrix, 1)), 2), (stiffness, 1))
+    restructured = apply_slate_restructuring(nested)
+    assert len(restructured.components()) == 2
+    assert_matrix_equal(assemble(nested), [(2, mass), (3, stiffness)])
+
+
+@pytest.mark.parallel([1, 3])
+def test_restructure_slate_expands_ufl_derivative():
+    mesh = UnitSquareMesh(4, 4)
+    V = FunctionSpace(mesh, "CG", 1)
+    Q = FunctionSpace(mesh, "DG", 0)
+    u = Function(V).interpolate(1 + SpatialCoordinate(mesh)[0])
+    mass = inner(TrialFunction(V), TestFunction(V)) * dx
+    # The derivative of the interpolation operator is only exposed by expanding the
+    # derivative, which the Slate compiler cannot do.
+    J = 0.5 * interpolate(u, Q)**4 * dx
+    H = derivative(derivative(J, u), u)
+    expr = FormSum((Tensor(mass), 1), (H, 1))
+
+    restructured = apply_slate_restructuring(expr)
+    assert isinstance(restructured, ufl.FormSum)
+    assert_matrix_equal(assemble(expr), [(1, mass), (1, H)])
+
+
+@pytest.mark.parametrize("operand", ["function", "control"])
+def test_action_derivative(operand):
+    mesh = UnitSquareMesh(3, 3)
+    V = FunctionSpace(mesh, "CG", 1)
+    x, y = SpatialCoordinate(mesh)
+    v = TestFunction(V)
+    m = Function(V).interpolate(x)
+    h = Function(V).interpolate(y)
+    w = {"function": Function(V).interpolate(1 + y), "control": m}[operand]
+    L = exp(m) * v * dx
+    A = ufl.Action(L, w)
+    expected = exp(m) * w * dx
+
+    dA = assemble(derivative(A, m))
+    assert np.allclose(dA.dat.data_ro, assemble(derivative(expected, m)).dat.data_ro)
+    assert np.isclose(assemble(derivative(A, m, h)), assemble(derivative(expected, m, h)))

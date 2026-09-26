@@ -1,7 +1,8 @@
 import pytest
 from firedrake import *
 from firedrake.formmanipulation import ExtractSubBlock
-from firedrake.slate.slate import ScalarMul, UnaryOp, as_slate
+from firedrake.slate.slate import ScalarMul, TensorBase, UnaryOp, apply_slate_restructuring, as_slate
+from ufl.equation import Equation
 from ufl.form import FormSum
 import math
 
@@ -222,6 +223,9 @@ def test_equality_relations(function_space):
     A = Tensor(inner(u, v) * dx)
     B = Tensor(inner(grad(u), grad(v)) * dx)
 
+    assert isinstance(A == B, Equation)
+    assert not A == 0
+    assert ScalarMul(0, A) == 0
     assert A == Tensor(inner(u, v) * dx)
     assert B != A
     assert B * f != A * f
@@ -229,6 +233,15 @@ def test_equality_relations(function_space):
     assert A*B != B*A
     assert B.T != B.inv
     assert A != -A
+
+
+def test_assembled_vector_reconstruct(function_space):
+    function = Function(function_space)
+    tensor = AssembledVector(function)
+
+    reconstructed = tensor.reconstruct(function)
+
+    assert reconstructed.form is function
 
 
 def test_blocks(zero_rank_tensor, mixed_matrix, mixed_vector):
@@ -307,6 +320,13 @@ def test_blocks(zero_rank_tensor, mixed_matrix, mixed_vector):
     assert F01.arguments() == splitter.split(L, ((0, 1),)).arguments()
     assert F12.arguments() == splitter.split(L, ((1, 2),)).arguments()
 
+    # A FormSum with a Slate component is split as one Slate expression.
+    mixed_sum = FormSum((M, 2), (a, 1))
+    M00_sum = splitter.split(mixed_sum, (0, 0))
+    assert isinstance(M00_sum, TensorBase)
+    assert M00_sum == splitter.split(as_slate(mixed_sum), (0, 0))
+    assert M00.arguments() == M00_sum.arguments()
+
 
 def test_implicit_casting_add_sub():
     mesh = UnitSquareMesh(1, 1)
@@ -328,11 +348,50 @@ def test_implicit_casting_add_sub():
 
     # combine slate Tensor and Cofunction
     c = Cofunction(V.dual())
-    s = AssembledVector(c)
-    assert b + c == b + s
-    assert b - c == b - s
-    assert as_slate(c + b) == s + b
-    assert as_slate(c - b) == s - b
+
+    def assert_form_sum(expr, components, weights):
+        assert isinstance(expr, FormSum)
+        assert all(actual is expected
+                   for actual, expected in zip(expr.components(), components))
+        assert tuple(expr.weights()) == weights
+
+    assert_form_sum(b + c, (b, c), (1, 1))
+    assert_form_sum(b - c, (b, c), (1, -1))
+    assert_form_sum(c + b, (c, b), (1, 1))
+    c_minus_b = c - b
+    assert isinstance(c_minus_b, FormSum)
+    assert c_minus_b.components()[0] is c
+    assert isinstance(c_minus_b.components()[1], ScalarMul)
+    assert c_minus_b.components()[1].scalar == -1
+    assert c_minus_b.components()[1].operands[0] is b
+    assert tuple(c_minus_b.weights()) == (1, 1)
+    assert_form_sum(apply_slate_restructuring(c + b), (b, c), (1, 1))
+    restructured_c_minus_b = apply_slate_restructuring(c_minus_b)
+    assert isinstance(restructured_c_minus_b, FormSum)
+    assert isinstance(restructured_c_minus_b.components()[0], ScalarMul)
+    assert restructured_c_minus_b.components()[0].scalar == -1
+    assert restructured_c_minus_b.components()[0].operands[0] is b
+    assert restructured_c_minus_b.components()[1] is c
+    assert tuple(restructured_c_minus_b.weights()) == (1, 1)
+
+
+def test_as_slate_cofunction_requires_dg_space():
+    mesh = UnitSquareMesh(1, 1)
+    cg = Cofunction(FunctionSpace(mesh, "CG", 1).dual())
+    dg = Cofunction(FunctionSpace(mesh, "DG", 1).dual())
+    v = TestFunction(FunctionSpace(mesh, "DG", 1))
+    tensor = Tensor(v * dx)
+
+    with pytest.raises(SlateConversionError):
+        as_slate(cg)
+    assert isinstance(as_slate(dg), AssembledVector)
+
+    restructured = apply_slate_restructuring(FormSum((tensor, 1), (dg, 1)))
+    assert isinstance(restructured, TensorBase)
+    assert restructured == tensor + as_slate(dg)
+
+    assert tensor.__mul__(cg) is NotImplemented
+    assert tensor.__rmul__(cg) is NotImplemented
 
 
 def test_scalar_multiplication():

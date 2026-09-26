@@ -170,7 +170,7 @@ def get_assembler(form, *args, **kwargs):
         # A matrix-free 2-form is left alone, because its action is preprocessed instead.
         form = BaseFormAssembler.preprocess_base_form(form, mat_type=mat_type,
                                                       form_compiler_parameters=fc_params)
-    if isinstance(form, (ufl.form.Form, slate.TensorBase)) and not BaseFormAssembler.base_form_operands(form):
+    if BaseFormAssembler.is_compilable(form):
         diagonal = kwargs.pop('diagonal', False)
         if len(form.arguments()) == 0:
             return ZeroFormAssembler(form, form_compiler_parameters=fc_params)
@@ -876,7 +876,9 @@ class BaseFormAssembler(AbstractFormAssembler):
             return ufl.action(expr, ustar)
 
         # -- Case (6) -- #
-        if isinstance(expr, ufl.FormSum) and all(ufl.duals.is_dual(a.function_space()) for a in expr.arguments()):
+        # A 0-form has no argument, so it is not a primal expression.
+        if (isinstance(expr, ufl.FormSum) and expr.arguments()
+                and all(ufl.duals.is_dual(a.function_space()) for a in expr.arguments())):
             # Return ufl.Sum if we are assembling a FormSum with Coarguments (a primal expression)
             return sum(w*c for w, c in zip(expr.weights(), expr.components()))
 
@@ -898,10 +900,14 @@ class BaseFormAssembler(AbstractFormAssembler):
             # Don't expand derivatives if `mat_type` is 'matfree'
             # For "matfree", Form evaluation is delayed
             expr = BaseFormAssembler.expand_derivatives_ufl_subtrees(expr, form_compiler_parameters)
+        expr = slate.apply_slate_restructuring(expr)
         if not isinstance(expr, (ufl.form.Form, slate.TensorBase)):
             # => No restructuring needed for Form and slate.TensorBase
             expr = BaseFormAssembler.restructure_base_form_preorder(expr)
             expr = BaseFormAssembler.restructure_base_form_postorder(expr)
+            # Restructuring turns the action of a form on a function into a form,
+            # which can then join a Slate subtree.
+            expr = slate.apply_slate_restructuring(expr)
         # Preprocessing the form makes a new object -> current form caching mechanism
         # will populate `expr`'s cache which is now different than `original_expr`'s cache so we need
         # to transmit the cache. All of this only holds when both are `ufl.Form` objects.
@@ -957,6 +963,12 @@ class BaseFormAssembler(AbstractFormAssembler):
             return ufl.algorithms.preprocess_form(expr, complex_mode)
 
         return ufl.algorithms.ad.expand_derivatives(expr)
+
+    @staticmethod
+    def is_compilable(expr: ufl.form.BaseForm | ufl.core.expr.Expr) -> bool:
+        """Return whether ``expr`` can be compiled without evaluating its operands first."""
+        return (isinstance(expr, (ufl.form.Form, slate.TensorBase))
+                and not BaseFormAssembler.base_form_operands(expr))
 
 
 class FormAssembler(AbstractFormAssembler):

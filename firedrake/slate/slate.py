@@ -20,27 +20,31 @@ import numbers
 import operator
 from collections import OrderedDict, namedtuple, defaultdict
 
+import ufl
 from ufl import Constant
 from ufl.coefficient import BaseCoefficient
 
 from firedrake.formmanipulation import ExtractSubBlock, subspace
+from firedrake.exceptions import SlateConversionError
 from firedrake.function import Function, Cofunction
 from firedrake.ufl_expr import TestFunction
 from firedrake.utils import unique
 
-from functools import cached_property
+from functools import cached_property, singledispatchmethod
 from itertools import chain, count
 
 from pyop2.utils import as_tuple
 
+from ufl.algorithms.analysis import has_type
 from ufl.algorithms.map_integrands import map_integrand_dags
 from ufl.algorithms.replace import replace
 from ufl.corealg.multifunction import MultiFunction
-from ufl.classes import Zero
+from ufl.classes import Expr, Zero
 from ufl.checks import is_true_ufl_scalar
 from ufl.constantvalue import ConstantValue, ScalarValue
 from ufl.domain import join_domains, sort_domains
 from ufl.form import BaseForm, Form, FormSum, ZeroBaseForm
+from ufl.corealg.dag_traverser import DAGTraverser
 import hashlib
 
 from tsfc.ufl_utils import extract_firedrake_constants
@@ -49,7 +53,17 @@ from tsfc.ufl_utils import extract_firedrake_constants
 __all__ = ['TensorBase', 'AssembledVector', 'Block', 'Factorization', 'Tensor',
            'Inverse', 'Transpose',
            'Add', 'Mul', 'ScalarMul', 'Solve', 'BlockAssembledVector', 'DiagonalTensor',
-           'Reciprocal']
+           'Reciprocal', 'apply_slate_restructuring',
+           'apply_slate_derivatives']
+
+
+def _is_dg_cofunction(expr):
+    """Return whether a Cofunction belongs to a discontinuous scalar space."""
+    if not isinstance(expr, Cofunction):
+        return False
+    space = expr.function_space().topological
+    return all(sub.finat_element.is_dg() for sub in space if sub.finat_element)
+
 
 # BlockFunction description type
 BlockFunction = namedtuple('BlockFunction', ['split_function', 'indices', 'orig_function'])
@@ -343,26 +357,36 @@ class TensorBase(BaseForm):
         return BlockIndexer(self)
 
     def __add__(self, other):
+        if isinstance(other, numbers.Number) and other == 0:
+            return self
         try:
             other = as_slate(other)
             return Add(self, other)
-        except TypeError:
+        except SlateConversionError:
+            if isinstance(other, BaseForm):
+                return BaseForm.__add__(self, other)
             return NotImplemented
 
     def __radd__(self, other):
+        if isinstance(other, numbers.Number) and other == 0:
+            return self
         # If other cannot be converted into a TensorBase, return NotImplemented.
         # Otherwise, delegate action to other.
         try:
             other = as_slate(other)
             return other + self
-        except TypeError:
+        except SlateConversionError:
+            if isinstance(other, BaseForm):
+                return BaseForm.__radd__(self, other)
             return NotImplemented
 
     def __sub__(self, other):
         try:
             other = as_slate(other)
             return Add(self, -other)
-        except TypeError:
+        except SlateConversionError:
+            if isinstance(other, BaseForm):
+                return BaseForm.__sub__(self, other)
             return NotImplemented
 
     def __rsub__(self, other):
@@ -371,7 +395,9 @@ class TensorBase(BaseForm):
         try:
             other = as_slate(other)
             return other - self
-        except TypeError:
+        except SlateConversionError:
+            if isinstance(other, BaseForm):
+                return BaseForm.__rsub__(self, other)
             return NotImplemented
 
     def __mul__(self, other):
@@ -380,7 +406,7 @@ class TensorBase(BaseForm):
         try:
             other = as_slate(other)
             return Mul(self, other)
-        except TypeError:
+        except SlateConversionError:
             return NotImplemented
 
     def __rmul__(self, other):
@@ -391,24 +417,25 @@ class TensorBase(BaseForm):
         try:
             other = as_slate(other)
             return other * self
-        except TypeError:
+        except SlateConversionError:
             return NotImplemented
 
     def __neg__(self):
         return ScalarMul(-1, self)
 
     def __eq__(self, other):
-        """Determines whether two TensorBase objects are equal using their
-        associated keys.
-        """
-        if isinstance(other, (int, float)) and other == 0:
-            if isinstance(self, Tensor):
-                return isinstance(self.form, ZeroBaseForm) or self.form.empty()
-            return False
-        return self._key == other._key
+        if self.empty() and isinstance(other, numbers.Number) and other == 0:
+            return True
+        return super().__eq__(other)
 
     def __ne__(self, other):
-        return not self.__eq__(other)
+        if self.empty() and isinstance(other, numbers.Number) and other == 0:
+            return False
+        return super().__ne__(other)
+
+    def equals(self, other):
+        """Return whether ``other`` is structurally equal to this tensor."""
+        return isinstance(other, TensorBase) and self._key == other._key
 
     @cached_property
     def _hash_id(self):
@@ -1275,10 +1302,10 @@ class ScalarMul(UnaryOp):
 
     def __new__(cls, scalar, tensor):
         scalar = cls._scalar_value(scalar)
-        if tensor == 0:
-            return tensor
         if not isinstance(tensor, TensorBase):
             raise TypeError("Can only scale Slate tensors.")
+        if tensor == 0:
+            return tensor
         if scalar == 0:
             return Tensor(ZeroBaseForm(tensor.arguments()))
         elif scalar == 1:
@@ -1617,7 +1644,9 @@ def as_slate(F):
         return F
     elif isinstance(F, (Form, ZeroBaseForm)):
         return Tensor(F)
-    elif isinstance(F, (Function, Cofunction)):
+    elif isinstance(F, Function):
+        return AssembledVector(F)
+    elif _is_dg_cofunction(F):
         return AssembledVector(F)
     elif isinstance(F, FormSum):
         return functools.reduce(
@@ -1625,7 +1654,215 @@ def as_slate(F):
             (w * as_slate(c)
              for c, w in zip(F.components(), F.weights())))
     else:
-        raise TypeError(f"Cannot convert {type(F).__name__} into a slate.Tensor")
+        raise SlateConversionError(f"Cannot convert {type(F).__name__} into a slate.Tensor")
+
+
+class SlateRestructurer(DAGTraverser):
+    """Restructure Slate-compatible subtrees into Slate tensors."""
+
+    @singledispatchmethod
+    def process(self, o):
+        return super().process(o)
+
+    @process.register(ufl.form.BaseForm)
+    @process.register(ufl.classes.Expr)
+    def base_form(self, o):
+        # Forms, coefficients, assembled tensors, and base-form operators are
+        # leaves of the base-form DAG.
+        return o
+
+    @process.register(TensorBase)
+    def slate_tensor(self, o):
+        return o
+
+    @process.register(ufl.classes.BaseFormDerivative)
+    @DAGTraverser.postorder
+    def base_form_derivative(self, o, base_form, coefficients, arguments, coefficient_derivatives):
+        if not has_type(base_form, TensorBase):
+            return self.reconstruct(o, base_form, coefficients, arguments, coefficient_derivatives)
+
+        coefficient = coefficients[0] if len(coefficients) == 1 else tuple(coefficients)
+        argument = arguments[0] if len(arguments) == 1 else tuple(arguments)
+        coefficient_derivatives = coefficient_derivatives.ufl_operands
+        coefficient_derivatives = dict(zip(coefficient_derivatives[::2], coefficient_derivatives[1::2]))
+        return apply_slate_derivatives(base_form, coefficient, argument, coefficient_derivatives)
+
+    @process.register(ufl.FormSum)
+    @DAGTraverser.postorder
+    def form_sum(self, o, *components):
+        if all(new is old for new, old in zip(components, o.components())):
+            new = o
+        else:
+            # The FormSum constructor flattens a component that is itself a FormSum.
+            new = self.reconstruct(o, *components)
+        if not isinstance(new, ufl.FormSum):
+            return new
+        terms = list(zip(new.components(), new.weights()))
+        slate_terms = [(c, w) for c, w in terms if self.is_slate_compatible_term(c, w)]
+        if not any(isinstance(c, TensorBase) for c, _ in slate_terms):
+            return new
+        slate_part = as_slate(ufl.FormSum(*slate_terms))
+        if len(slate_terms) == len(terms):
+            return slate_part
+        other_terms = [(c, w) for c, w in terms if not self.is_slate_compatible_term(c, w)]
+        return ufl.FormSum((slate_part, 1), *other_terms)
+
+    @process.register(ufl.Action)
+    @DAGTraverser.postorder
+    def action(self, o, left, right):
+        if (any(isinstance(op, TensorBase) for op in (left, right))
+                and len(left.arguments()) == 2
+                and self.is_slate_compatible(left)
+                and self.is_slate_compatible(right)):
+            return as_slate(left) * right
+        return self.reconstruct(o, left, right)
+
+    @process.register(ufl.Adjoint)
+    @DAGTraverser.postorder
+    def adjoint(self, o, form):
+        if isinstance(form, TensorBase):
+            if form.rank != 2:
+                raise ValueError("Expecting rank-2 tensor")
+            return form.T
+        return self.reconstruct(o, form)
+
+    @staticmethod
+    def reconstruct(o, *operands):
+        """Reconstruct ``o`` if its operands changed."""
+        if all(new is old for new, old in zip(operands, o.ufl_operands)):
+            return o
+        if isinstance(o, ufl.FormSum):
+            return ufl.FormSum(*zip(operands, o.weights()))
+        return o._ufl_expr_reconstruct_(*operands)
+
+    @staticmethod
+    def is_slate_compatible(expr: ufl.form.BaseForm) -> bool:
+        """Return whether ``expr`` can be represented by Slate."""
+        if isinstance(expr, (ufl.ZeroBaseForm, Function)) or _is_dg_cofunction(expr):
+            return True
+        if isinstance(expr, (ufl.form.Form, TensorBase)):
+            from firedrake.assemble import BaseFormAssembler
+            return BaseFormAssembler.is_compilable(expr)
+        if isinstance(expr, ufl.FormSum):
+            return all(SlateRestructurer.is_slate_compatible_term(c, w)
+                       for c, w in zip(expr.components(), expr.weights()))
+        return False
+
+    @staticmethod
+    def is_slate_compatible_term(component: ufl.form.BaseForm, weight) -> bool:
+        """Return whether a weighted component can be represented by Slate."""
+        return (isinstance(weight, (numbers.Number, ufl.constantvalue.ConstantValue))
+                and SlateRestructurer.is_slate_compatible(component))
+
+
+class SlateDerivative(DAGTraverser):
+    """Differentiate forms that contain Slate tensors."""
+
+    def __init__(self, coefficient, argument, coefficient_derivatives):
+        super().__init__()
+        self.coefficient = coefficient
+        self.argument = argument
+        self.coefficient_derivatives = coefficient_derivatives
+
+    @singledispatchmethod
+    def process(self, o):
+        return super().process(o)
+
+    @process.register(Tensor)
+    def tensor(self, o):
+        if self.coefficient not in o.coefficients():
+            return Tensor(ZeroBaseForm(o.form.arguments()), diagonal=o.diagonal)
+        from firedrake.ufl_expr import derivative
+        return Tensor(derivative(o.form, self.coefficient, self.argument,
+                                 self.coefficient_derivatives),
+                      diagonal=o.diagonal)
+
+    @process.register(AssembledVector)
+    def assembled_vector(self, o):
+        if self.coefficient not in o.coefficients():
+            return Tensor(ZeroBaseForm(o.arguments()))
+        # The direction is consumed by ``mul`` when this vector is the right
+        # operand of a Slate action.
+        return self.argument
+
+    @process.register(TensorBase)
+    def slate_node(self, o):
+        raise NotImplementedError(f"Differentiation of {type(o).__name__} is not implemented.")
+
+    @process.register(FormSum)
+    @DAGTraverser.postorder
+    def form_sum(self, o, *components):
+        return FormSum(*zip(components, o.weights()))
+
+    @process.register(BaseForm)
+    @process.register(Expr)
+    def ufl_operand(self, o):
+        if has_type(o, TensorBase):
+            raise NotImplementedError(
+                f"Cannot differentiate a {type(o).__name__} that has a Slate operand."
+            )
+        from firedrake.ufl_expr import derivative
+        return derivative(o, self.coefficient, self.argument, self.coefficient_derivatives)
+
+    @process.register(Block)
+    def block(self, o):
+        return Block(self(o.operands[0]), o._indices)
+
+    @process.register(Factorization)
+    @DAGTraverser.postorder
+    def factorization(self, o, operand):
+        return operand
+
+    @process.register(Add)
+    @DAGTraverser.postorder
+    def add(self, o, left, right):
+        return left + right
+
+    @process.register(Mul)
+    @DAGTraverser.postorder
+    def mul(self, o, left, right):
+        if (isinstance(o.operands[1], AssembledVector)
+                and self.coefficient in o.operands[1].coefficients()):
+            return left * o.operands[1] + o.operands[0]
+        return left * o.operands[1] + o.operands[0] * right
+
+    @process.register(ScalarMul)
+    @DAGTraverser.postorder
+    def scalar_mul(self, o, operand):
+        return o.scalar * operand
+
+    @process.register(Transpose)
+    @DAGTraverser.postorder
+    def transpose(self, o, operand):
+        return operand.T
+
+    @process.register(Inverse)
+    @DAGTraverser.postorder
+    def inverse(self, o, operand):
+        return -o * operand * o
+
+    @process.register(Solve)
+    @DAGTraverser.postorder
+    def solve(self, o, left, right):
+        A, B = o.operands
+        return A.inv * (right - left * o)
+
+    @process.register(DiagonalTensor)
+    @DAGTraverser.postorder
+    def diagonal(self, o, operand):
+        return DiagonalTensor(operand)
+
+
+def apply_slate_restructuring(expr: ufl.form.BaseForm) -> ufl.form.BaseForm:
+    """Restructure Slate-compatible subtrees in ``expr``."""
+    return SlateRestructurer()(expr)
+
+
+def apply_slate_derivatives(tensor, coefficient, argument=None,
+                            coefficient_derivatives=None):
+    """Apply Slate-aware coefficient differentiation to ``tensor``."""
+    tensor = apply_slate_restructuring(tensor)
+    return SlateDerivative(coefficient, argument, coefficient_derivatives)(tensor)
 
 
 # Establishes levels of precedence for Slate tensors
